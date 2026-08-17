@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
-import { Search, Plus, X, Trash2, Pencil, Sparkles, PlayCircle, ChevronDown, ChevronRight, LayoutGrid, List as ListIcon, Star, Film, Share2, Download, Copy, Check, Cloud, CloudOff } from "lucide-react";
+import { Search, Plus, X, Trash2, Pencil, Sparkles, PlayCircle, ChevronDown, ChevronRight, LayoutGrid, List as ListIcon, Star, Film, Share2, Download, Copy, Check, Cloud, CloudOff, Users, Home, UserRound, CheckSquare } from "lucide-react";
 import { isSupabaseConfigured, createShareRow, getShareRow } from "./supabaseClient";
 
 const STORAGE_KEY = "anime-watchlist-v3";
@@ -93,6 +93,14 @@ export default function AnimeWatchlist() {
   const [shareBusy, setShareBusy] = useState(false);
   const [shareMessage, setShareMessage] = useState("");
   const [copied, setCopied] = useState(false);
+
+  // 分開「我的清單」與「他人清單」，朋友資料只會暫存在 friendItems。
+  const [currentPage, setCurrentPage] = useState("home");
+  const [friendItems, setFriendItems] = useState([]);
+  const [friendCustomTypes, setFriendCustomTypes] = useState([]);
+  const [friendShareCode, setFriendShareCode] = useState("");
+  const [selectedFriendIds, setSelectedFriendIds] = useState(() => new Set());
+  const [friendMessage, setFriendMessage] = useState("");
   const saveTimer = useRef(null);
   const firstLoad = useRef(true);
 
@@ -319,40 +327,38 @@ export default function AnimeWatchlist() {
   const importShare = async () => {
     const code = shareInput.trim().toUpperCase();
     if (!code) return;
+
     setShareBusy(true);
     setShareMessage("");
+    setFriendMessage("");
+    setFriendItems([]);
+    setFriendCustomTypes([]);
+    setSelectedFriendIds(new Set());
+
     try {
+      let payload;
+
       if (code.startsWith("LOCAL-")) {
         const json = decodeURIComponent(escape(atob(code.slice(6))));
-        const payload = JSON.parse(json);
-        const imported = Array.isArray(payload.items) ? payload.items : [];
-        const existingIds = new Set(items.map((x) => x.id));
-        const merged = imported.map((x) => existingIds.has(x.id) ? { ...x, id: `import-${Date.now()}-${Math.random().toString(36).slice(2, 7)}` } : x);
-        setItems((prev) => [...merged, ...prev]);
-        if (Array.isArray(payload.customTypes)) {
-          setCustomTypes((prev) => {
-            const ids = new Set(prev.map((x) => x.id));
-            return [...prev, ...payload.customTypes.filter((x) => !ids.has(x.id))];
-          });
-        }
-        setShareMessage(`已匯入 ${merged.length} 部作品；原本的資料沒有被覆蓋。`);
+        payload = JSON.parse(json);
       } else {
         if (!isSupabaseConfigured) throw new Error("尚未設定雲端資料庫");
         const data = await getShareRow(code);
         if (!data?.payload) throw new Error("找不到這組分享碼");
-        const payload = data.payload;
-        const imported = Array.isArray(payload.items) ? payload.items : [];
-        const existingIds = new Set(items.map((x) => x.id));
-        const merged = imported.map((x) => existingIds.has(x.id) ? { ...x, id: `import-${Date.now()}-${Math.random().toString(36).slice(2, 7)}` } : x);
-        setItems((prev) => [...merged, ...prev]);
-        if (Array.isArray(payload.customTypes)) {
-          setCustomTypes((prev) => {
-            const ids = new Set(prev.map((x) => x.id));
-            return [...prev, ...payload.customTypes.filter((x) => !ids.has(x.id))];
-          });
-        }
-        setShareMessage(`已匯入 ${merged.length} 部作品；你的原有資料保持不變。`);
+        payload = data.payload;
       }
+
+      const imported = Array.isArray(payload.items) ? payload.items : [];
+      const importedTypes = Array.isArray(payload.customTypes) ? payload.customTypes : [];
+
+      setFriendItems(imported);
+      setFriendCustomTypes(importedTypes);
+      setFriendShareCode(code);
+      setSelectedFriendIds(new Set());
+      setCurrentPage("friends");
+      setShowShare(false);
+      setShareInput("");
+      setFriendMessage(`成功載入 ${imported.length} 部作品。這些作品目前只在「他人清單」中，不會加入你的清單。`);
     } catch (e) {
       console.error(e);
       setShareMessage(`匯入失敗：${e.message || "請確認分享碼"}`);
@@ -360,6 +366,68 @@ export default function AnimeWatchlist() {
       setShareBusy(false);
     }
   };
+
+  const toggleFriendItem = (id) => {
+    setSelectedFriendIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAllFriendItems = () => {
+    if (friendItems.length > 0 && selectedFriendIds.size === friendItems.length) {
+      setSelectedFriendIds(new Set());
+    } else {
+      setSelectedFriendIds(new Set(friendItems.map((it) => it.id)));
+    }
+  };
+
+  const closeFriendList = () => {
+    setFriendItems([]);
+    setFriendCustomTypes([]);
+    setSelectedFriendIds(new Set());
+    setFriendShareCode("");
+    setFriendMessage("");
+    setCurrentPage("friends");
+  };
+
+  const importSelectedFriendItems = () => {
+    if (selectedFriendIds.size === 0) {
+      setFriendMessage("請先勾選想加入自己清單的作品。");
+      return;
+    }
+
+    const selected = friendItems.filter((it) => selectedFriendIds.has(it.id));
+    const existingTitles = new Set(items.map((it) => (it.title || "").trim().toLowerCase()));
+    const duplicates = selected.filter((it) => existingTitles.has((it.title || "").trim().toLowerCase()));
+    const toImport = selected.filter((it) => !existingTitles.has((it.title || "").trim().toLowerCase()));
+
+    setItems((prev) => [
+      ...toImport.map((it, index) => ({
+        ...it,
+        id: `import-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 7)}`,
+        updatedAt: Date.now(),
+      })),
+      ...prev,
+    ]);
+
+    if (friendCustomTypes.length > 0) {
+      setCustomTypes((prev) => {
+        const ids = new Set(prev.map((t) => t.id));
+        return [...prev, ...friendCustomTypes.filter((t) => !ids.has(t.id))];
+      });
+    }
+
+    setSelectedFriendIds(new Set());
+    setFriendMessage(
+      `已選 ${selected.length} 部：新增 ${toImport.length} 部${duplicates.length ? `，${duplicates.length} 部因為你的清單已經有同名作品而跳過` : ""}。`
+    );
+  };
+
+  const friendTypeInfo = (id) =>
+    [...BUILTIN_TYPES, ...customTypes, ...friendCustomTypes].find((t) => t.id === id) || BUILTIN_TYPES[3];
 
   const copyShareCode = async () => {
     if (!shareCode) return;
@@ -441,27 +509,51 @@ export default function AnimeWatchlist() {
               追番手帳 <span style={{ color: "#F2A65A" }}>WATCHLIST</span>
             </div>
             <div style={{ fontSize: 12.5, color: "#9B9BC0", marginTop: 2 }}>
-              共 {items.length} 部・{items.filter((i) => i.watched).length} 部已看完
+              {currentPage === "home"
+                ? `共 ${items.length} 部・${items.filter((i) => i.watched).length} 部已看完`
+                : friendShareCode
+                  ? `正在查看分享碼 ${friendShareCode}・${friendItems.length} 部作品`
+                  : "查看朋友分享的清單，不會影響你的資料"}
             </div>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
-            <div style={{ display: "flex", background: "#262A44", borderRadius: 10, padding: 3 }}>
-              <button onClick={() => setViewMode("grid")} style={{ border: "none", borderRadius: 8, padding: "7px 10px", background: viewMode === "grid" ? "#3A3E5C" : "transparent", color: viewMode === "grid" ? "#F5EFE6" : "#6E7196", cursor: "pointer", display: "flex" }} aria-label="卡片檢視">
-                <LayoutGrid size={15} />
+            {currentPage === "home" ? (
+              <>
+                <div style={{ display: "flex", background: "#262A44", borderRadius: 10, padding: 3 }}>
+                  <button onClick={() => setViewMode("grid")} style={{ border: "none", borderRadius: 8, padding: "7px 10px", background: viewMode === "grid" ? "#3A3E5C" : "transparent", color: viewMode === "grid" ? "#F5EFE6" : "#6E7196", cursor: "pointer", display: "flex" }} aria-label="卡片檢視">
+                    <LayoutGrid size={15} />
+                  </button>
+                  <button onClick={() => setViewMode("list")} style={{ border: "none", borderRadius: 8, padding: "7px 10px", background: viewMode === "list" ? "#3A3E5C" : "transparent", color: viewMode === "list" ? "#F5EFE6" : "#6E7196", cursor: "pointer", display: "flex" }} aria-label="精簡列表">
+                    <ListIcon size={15} />
+                  </button>
+                </div>
+                <button onClick={() => { setShowShare(true); setShareMessage(""); setShareCode(""); }} style={{ display: "flex", alignItems: "center", gap: 6, background: "#262A44", color: "#F5EFE6", border: "1px solid #3A3E5C", borderRadius: 12, padding: "10px 14px", fontWeight: 800, fontSize: 13, cursor: "pointer" }}>
+                  <Share2 size={15} /> 分享
+                </button>
+                <button onClick={openAdd} style={{ display: "flex", alignItems: "center", gap: 6, background: "#F2A65A", color: "#1B1D2E", border: "none", borderRadius: 12, padding: "10px 16px", fontWeight: 900, fontSize: 13, cursor: "pointer" }}>
+                  <Plus size={16} /> 新增作品
+                </button>
+              </>
+            ) : (
+              <button onClick={() => { setShowShare(true); setShareMessage(""); setShareCode(""); }} style={{ display: "flex", alignItems: "center", gap: 6, background: "#262A44", color: "#F5EFE6", border: "1px solid #3A3E5C", borderRadius: 12, padding: "10px 14px", fontWeight: 800, fontSize: 13, cursor: "pointer" }}>
+                <Users size={15} /> 查看另一位朋友
               </button>
-              <button onClick={() => setViewMode("list")} style={{ border: "none", borderRadius: 8, padding: "7px 10px", background: viewMode === "list" ? "#3A3E5C" : "transparent", color: viewMode === "list" ? "#F5EFE6" : "#6E7196", cursor: "pointer", display: "flex" }} aria-label="精簡列表">
-                <ListIcon size={15} />
-              </button>
-            </div>
-            <button onClick={() => { setShowShare(true); setShareMessage(""); setShareCode(""); }} style={{ display: "flex", alignItems: "center", gap: 6, background: "#262A44", color: "#F5EFE6", border: "1px solid #3A3E5C", borderRadius: 12, padding: "10px 14px", fontWeight: 800, fontSize: 13, cursor: "pointer" }}>
-              <Share2 size={15} /> 分享
-            </button>
-            <button onClick={openAdd} style={{ display: "flex", alignItems: "center", gap: 6, background: "#F2A65A", color: "#1B1D2E", border: "none", borderRadius: 12, padding: "10px 16px", fontWeight: 900, fontSize: 13, cursor: "pointer" }}>
-              <Plus size={16} /> 新增作品
-            </button>
+            )}
           </div>
         </div>
 
+        {/* Page navigation */}
+        <div style={{ display: "flex", gap: 6, background: "#262A44", borderRadius: 14, padding: 5, marginBottom: 16, position: "sticky", bottom: 12, zIndex: 20, boxShadow: "0 8px 24px rgba(0,0,0,0.2)" }}>
+          <button onClick={() => setCurrentPage("home")} style={{ flex: 1, border: "none", borderRadius: 10, padding: "10px 12px", background: currentPage === "home" ? "#5FD3C4" : "transparent", color: currentPage === "home" ? "#1B1D2E" : "#9B9BC0", fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}>
+            <Home size={15} /> 我的清單
+          </button>
+          <button onClick={() => setCurrentPage("friends")} style={{ flex: 1, border: "none", borderRadius: 10, padding: "10px 12px", background: currentPage === "friends" ? "#5FD3C4" : "transparent", color: currentPage === "friends" ? "#1B1D2E" : "#9B9BC0", fontWeight: 900, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}>
+            <Users size={15} /> 他人清單
+          </button>
+        </div>
+
+        {currentPage === "home" && (
+          <>
         {/* Search + filters */}
         <div style={{ background: "#262A44", borderRadius: 16, padding: 14, marginBottom: 16 }}>
           <div style={{ position: "relative", marginBottom: 10 }}>
@@ -676,6 +768,8 @@ export default function AnimeWatchlist() {
             </div>
           </div>
         )}
+          </>
+        )}
 
         {showShare && (
           <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={() => setShowShare(false)}>
@@ -728,8 +822,75 @@ export default function AnimeWatchlist() {
           </div>
         )}
 
+        {/* Other people's list */}
+        {currentPage === "friends" && (
+          <div style={{ background: "#262A44", borderRadius: 16, border: "1px solid #313552", padding: 16, marginBottom: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 14 }}>
+              <div>
+                <div style={{ fontSize: 17, fontWeight: 900, display: "flex", alignItems: "center", gap: 7 }}><UserRound size={18} /> 他人的觀看清單</div>
+                <div style={{ fontSize: 11.5, color: "#9B9BC0", marginTop: 4 }}>分享碼：{friendShareCode || "尚未載入"}</div>
+              </div>
+              <button onClick={closeFriendList} title="關閉這份朋友清單" style={{ width: 34, height: 34, borderRadius: 9, border: "1px solid #3A3E5C", background: "#1F2238", color: "#9B9BC0", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}><X size={17} /></button>
+            </div>
+
+            {friendItems.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+                <button onClick={toggleAllFriendItems} style={{ border: "1px solid #3A3E5C", borderRadius: 9, background: "#1F2238", color: "#C7C6E0", padding: "8px 12px", cursor: "pointer", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                  <CheckSquare size={14} /> {selectedFriendIds.size === friendItems.length ? "取消全選" : "全部選取"}
+                </button>
+                <button onClick={importSelectedFriendItems} style={{ border: "none", borderRadius: 9, background: "#5FD3C4", color: "#1B1D2E", padding: "8px 14px", cursor: "pointer", fontWeight: 900, fontSize: 12 }}>
+                  加入我的清單{selectedFriendIds.size > 0 ? `（${selectedFriendIds.size}）` : ""}
+                </button>
+              </div>
+            )}
+
+            {friendMessage && <div style={{ background: "#1F2238", borderRadius: 9, padding: 10, marginBottom: 12, color: "#C7C6E0", fontSize: 12, lineHeight: 1.5 }}>{friendMessage}</div>}
+
+            {friendItems.length === 0 ? (
+              <div style={{ textAlign: "center", color: "#6E7196", padding: "34px 0", fontSize: 13 }}>
+                <Users size={20} style={{ marginBottom: 8 }} />
+                <div>目前沒有載入朋友清單。</div>
+                <div style={{ marginTop: 5 }}>按右上角「查看另一位朋友」輸入分享碼即可。</div>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {friendItems.map((it) => {
+                  const t = friendTypeInfo(it.type);
+                  const selected = selectedFriendIds.has(it.id);
+                  const alreadyExists = items.some((mine) => (mine.title || "").trim().toLowerCase() === (it.title || "").trim().toLowerCase());
+                  return (
+                    <div key={it.id} style={{ background: "#1F2238", borderRadius: 12, border: selected ? "1px solid #5FD3C4" : "1px solid #313552", padding: 12 }}>
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                        <input type="checkbox" checked={selected} onChange={() => toggleFriendItem(it.id)} style={{ width: 18, height: 18, marginTop: 3, accentColor: "#5FD3C4", cursor: "pointer" }} />
+                        <div style={{ width: 38, height: 38, borderRadius: 10, background: t.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }}>{it.icon || t.emoji}</div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                            <div style={{ fontWeight: 900, fontSize: 14 }}>{it.title}</div>
+                            <span style={{ fontSize: 10.5, padding: "2px 7px", borderRadius: 999, background: it.watched ? "rgba(95,211,196,0.15)" : "rgba(242,114,111,0.15)", color: it.watched ? "#5FD3C4" : "#F2726F" }}>{it.watched ? "已看" : "未看"}</span>
+                            {alreadyExists && <span style={{ fontSize: 10.5, color: "#5FD3C4" }}>✓ 你已有</span>}
+                          </div>
+                          <div style={{ marginTop: 4 }}><Stars value={it.rating} /></div>
+                          <div style={{ fontSize: 11.5, color: "#9B9BC0", marginTop: 5 }}>{progressText(it)}</div>
+                          {it.review && <div style={{ marginTop: 8, fontSize: 12.5, color: "#C7C6E0", lineHeight: 1.6 }}><strong style={{ color: "#F2A65A" }}>心得：</strong>{it.review}</div>}
+                          {it.highlights?.length > 0 && (
+                            <div style={{ marginTop: 8, background: "#262A44", borderRadius: 8, padding: 8 }}>
+                              <div style={{ fontSize: 11.5, color: "#F2A65A", fontWeight: 800, marginBottom: 5 }}>⭐ 精彩重播</div>
+                              {it.highlights.map((h) => <div key={h.id} style={{ fontSize: 11.5, color: "#C7C6E0", marginTop: 3 }}><span style={{ color: "#F2A65A", fontWeight: 700 }}>{h.position}</span> — {h.title}</div>)}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* List */}
-        {filtered.length === 0 ? (
+        {currentPage === "home" && (
+          filtered.length === 0 ? (
           <div style={{ textAlign: "center", color: "#6E7196", padding: "40px 0", fontSize: 13 }}>
             <Sparkles size={20} style={{ marginBottom: 8 }} />
             <div>還沒有作品，點右上角新增一部吧</div>
@@ -857,7 +1018,7 @@ export default function AnimeWatchlist() {
               );
             })}
           </div>
-        )}
+        ))}
 
         {visibleCount < filtered.length && (
           <div style={{ textAlign: "center", marginTop: 18 }}>
