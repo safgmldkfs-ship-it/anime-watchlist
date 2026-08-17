@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
-import { Search, Plus, X, Trash2, Pencil, Sparkles, PlayCircle, ChevronDown, ChevronRight, LayoutGrid, List as ListIcon, Star, Film } from "lucide-react";
+import { Search, Plus, X, Trash2, Pencil, Sparkles, PlayCircle, ChevronDown, ChevronRight, LayoutGrid, List as ListIcon, Star, Film, Share2, Download, Copy, Check, Cloud, CloudOff } from "lucide-react";
+import { isSupabaseConfigured, createShareRow, getShareRow } from "./supabaseClient";
 
 const STORAGE_KEY = "anime-watchlist-v3";
 const PAGE_SIZE = 30;
+const LOCAL_PROFILE_KEY = "anime-watchlist-profile-v1";
 
 const BUILTIN_TYPES = [
   { id: "anime", label: "動畫", emoji: "🎬", color: "#5FD3C4", builtin: true },
@@ -85,6 +87,12 @@ export default function AnimeWatchlist() {
   const [expandedIds, setExpandedIds] = useState(() => new Set());
   const [expandedHighlights, setExpandedHighlights] = useState(() => new Set());
   const [saveState, setSaveState] = useState("idle");
+  const [showShare, setShowShare] = useState(false);
+  const [shareCode, setShareCode] = useState("");
+  const [shareInput, setShareInput] = useState("");
+  const [shareBusy, setShareBusy] = useState(false);
+  const [shareMessage, setShareMessage] = useState("");
+  const [copied, setCopied] = useState(false);
   const saveTimer = useRef(null);
   const firstLoad = useRef(true);
 
@@ -94,15 +102,15 @@ export default function AnimeWatchlist() {
   useEffect(() => {
     (async () => {
       try {
-        const result = await window.storage.get(STORAGE_KEY, false);
-        if (result && result.value) {
-          const parsed = JSON.parse(result.value);
+        const value = localStorage.getItem(STORAGE_KEY);
+        if (value) {
+          const parsed = JSON.parse(value);
           if (Array.isArray(parsed.items)) setItems(parsed.items);
           if (Array.isArray(parsed.customTypes)) setCustomTypes(parsed.customTypes);
           if (parsed.viewMode === "grid" || parsed.viewMode === "list") setViewMode(parsed.viewMode);
         }
       } catch (e) {
-        // no data yet
+        console.warn("讀取本機資料失敗", e);
       } finally {
         setLoading(false);
       }
@@ -117,15 +125,17 @@ export default function AnimeWatchlist() {
     }
     setSaveState("saving");
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(async () => {
+    saveTimer.current = setTimeout(() => {
       try {
-        const result = await window.storage.set(STORAGE_KEY, JSON.stringify({ items, viewMode, customTypes }), false);
-        setSaveState(result ? "saved" : "idle");
+        // 永久保存於這台瀏覽器；也修正舊版沒有保存 customTypes 的問題。
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ items, customTypes, viewMode, savedAt: Date.now() }));
+        setSaveState("saved");
         setTimeout(() => setSaveState("idle"), 1200);
       } catch (e) {
+        console.warn("本機儲存失敗", e);
         setSaveState("idle");
       }
-    }, 500);
+    }, 300);
     return () => clearTimeout(saveTimer.current);
   }, [items, viewMode, customTypes, loading]);
 
@@ -137,7 +147,19 @@ export default function AnimeWatchlist() {
     let list = items;
     if (search.trim()) {
       const q = search.trim().toLowerCase();
-      list = list.filter((it) => it.title.toLowerCase().includes(q));
+      list = list.filter((it) => {
+        const typeLabel = typeInfo(it.type)?.label || "";
+        const highlights = (it.highlights || []).map((h) => `${h.position || ""} ${h.title || ""}`).join(" ");
+        const haystack = [
+          it.title,
+          it.review,
+          it.progressDetail,
+          it.progressUnit,
+          typeLabel,
+          highlights,
+        ].filter(Boolean).join(" ").toLowerCase();
+        return haystack.includes(q);
+      });
     }
     if (watchedFilter === "watched") list = list.filter((it) => it.watched);
     if (watchedFilter === "unwatched") list = list.filter((it) => !it.watched);
@@ -257,6 +279,105 @@ export default function AnimeWatchlist() {
     setForm(emptyForm("anime"));
   };
 
+  const makeShareCode = () => {
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let code = "";
+    for (let i = 0; i < 8; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    return code;
+  };
+
+  const createShare = async () => {
+    setShareBusy(true);
+    setShareMessage("");
+    setCopied(false);
+    try {
+      const payload = { items, customTypes, viewMode, exportedAt: Date.now() };
+      if (!isSupabaseConfigured) {
+        // 沒有設定雲端資料庫時，仍可產生本機匯出碼，方便備份/搬家。
+        const code = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+        setShareCode(`LOCAL-${code}`);
+        setShareMessage("目前是本機分享碼，只適合匯出/匯入；要讓朋友跨電腦輸入分享碼觀看，請完成 Supabase 設定。");
+        return;
+      }
+      let code = makeShareCode();
+      for (let i = 0; i < 5; i++) {
+        const existing = await getShareRow(code);
+        if (!existing) break;
+        code = makeShareCode();
+      }
+      await createShareRow(code, payload);
+      setShareCode(code);
+      setShareMessage("分享碼已建立。朋友輸入這組碼即可查看，不會覆蓋他自己的資料。");
+    } catch (e) {
+      console.error(e);
+      setShareMessage(`分享失敗：${e.message || "請檢查 Supabase 設定"}`);
+    } finally {
+      setShareBusy(false);
+    }
+  };
+
+  const importShare = async () => {
+    const code = shareInput.trim().toUpperCase();
+    if (!code) return;
+    setShareBusy(true);
+    setShareMessage("");
+    try {
+      if (code.startsWith("LOCAL-")) {
+        const json = decodeURIComponent(escape(atob(code.slice(6))));
+        const payload = JSON.parse(json);
+        const imported = Array.isArray(payload.items) ? payload.items : [];
+        const existingIds = new Set(items.map((x) => x.id));
+        const merged = imported.map((x) => existingIds.has(x.id) ? { ...x, id: `import-${Date.now()}-${Math.random().toString(36).slice(2, 7)}` } : x);
+        setItems((prev) => [...merged, ...prev]);
+        if (Array.isArray(payload.customTypes)) {
+          setCustomTypes((prev) => {
+            const ids = new Set(prev.map((x) => x.id));
+            return [...prev, ...payload.customTypes.filter((x) => !ids.has(x.id))];
+          });
+        }
+        setShareMessage(`已匯入 ${merged.length} 部作品；原本的資料沒有被覆蓋。`);
+      } else {
+        if (!isSupabaseConfigured) throw new Error("尚未設定雲端資料庫");
+        const data = await getShareRow(code);
+        if (!data?.payload) throw new Error("找不到這組分享碼");
+        const payload = data.payload;
+        const imported = Array.isArray(payload.items) ? payload.items : [];
+        const existingIds = new Set(items.map((x) => x.id));
+        const merged = imported.map((x) => existingIds.has(x.id) ? { ...x, id: `import-${Date.now()}-${Math.random().toString(36).slice(2, 7)}` } : x);
+        setItems((prev) => [...merged, ...prev]);
+        if (Array.isArray(payload.customTypes)) {
+          setCustomTypes((prev) => {
+            const ids = new Set(prev.map((x) => x.id));
+            return [...prev, ...payload.customTypes.filter((x) => !ids.has(x.id))];
+          });
+        }
+        setShareMessage(`已匯入 ${merged.length} 部作品；你的原有資料保持不變。`);
+      }
+    } catch (e) {
+      console.error(e);
+      setShareMessage(`匯入失敗：${e.message || "請確認分享碼"}`);
+    } finally {
+      setShareBusy(false);
+    }
+  };
+
+  const copyShareCode = async () => {
+    if (!shareCode) return;
+    await navigator.clipboard?.writeText(shareCode);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1200);
+  };
+
+  const exportBackup = () => {
+    const blob = new Blob([JSON.stringify({ items, customTypes, viewMode }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `anime-watchlist-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const toggleExpanded = (id) => {
     setExpandedIds((prev) => {
       const next = new Set(prev);
@@ -332,6 +453,9 @@ export default function AnimeWatchlist() {
                 <ListIcon size={15} />
               </button>
             </div>
+            <button onClick={() => { setShowShare(true); setShareMessage(""); setShareCode(""); }} style={{ display: "flex", alignItems: "center", gap: 6, background: "#262A44", color: "#F5EFE6", border: "1px solid #3A3E5C", borderRadius: 12, padding: "10px 14px", fontWeight: 800, fontSize: 13, cursor: "pointer" }}>
+              <Share2 size={15} /> 分享
+            </button>
             <button onClick={openAdd} style={{ display: "flex", alignItems: "center", gap: 6, background: "#F2A65A", color: "#1B1D2E", border: "none", borderRadius: 12, padding: "10px 16px", fontWeight: 900, fontSize: 13, cursor: "pointer" }}>
               <Plus size={16} /> 新增作品
             </button>
@@ -342,7 +466,7 @@ export default function AnimeWatchlist() {
         <div style={{ background: "#262A44", borderRadius: 16, padding: 14, marginBottom: 16 }}>
           <div style={{ position: "relative", marginBottom: 10 }}>
             <Search size={15} style={{ position: "absolute", left: 10, top: 10, color: "#6E7196" }} />
-            <input className="field" style={{ paddingLeft: 32 }} placeholder="搜尋標題..." value={search} onChange={(e) => setSearch(e.target.value)} />
+            <input className="field" style={{ paddingLeft: 32 }} placeholder="搜尋作品、心得、精華、進度...（輸入 1～2 個字也可以）" value={search} onChange={(e) => setSearch(e.target.value)} />
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
             {[{ id: "all", label: "全部" }, { id: "watched", label: "已看過" }, { id: "unwatched", label: "未看過" }].map((f) => (
@@ -549,6 +673,57 @@ export default function AnimeWatchlist() {
                   儲存
                 </button>
               </div>
+            </div>
+          </div>
+        )}
+
+        {showShare && (
+          <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={() => setShowShare(false)}>
+            <div style={{ width: "min(520px, 100%)", background: "#262A44", border: "1px solid #3A3E5C", borderRadius: 18, padding: 20, boxShadow: "0 20px 60px rgba(0,0,0,0.35)" }} onClick={(e) => e.stopPropagation()}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+                <div style={{ fontSize: 18, fontWeight: 900 }}>分享／匯入</div>
+                <button onClick={() => setShowShare(false)} style={{ background: "transparent", border: "none", color: "#9B9BC0", cursor: "pointer" }}><X size={18} /></button>
+              </div>
+
+              <div style={{ background: "#1F2238", borderRadius: 12, padding: 14, marginBottom: 12 }}>
+                <div style={{ fontWeight: 800, marginBottom: 5 }}>分享我的觀看列表</div>
+                <div style={{ fontSize: 12, color: "#9B9BC0", lineHeight: 1.6, marginBottom: 10 }}>
+                  會包含作品、觀看進度、評分、心得與精彩重播。朋友匯入後會合併到自己的列表，不會清掉原本資料。
+                </div>
+                <button disabled={shareBusy} onClick={createShare} style={{ border: "none", borderRadius: 10, background: "#5FD3C4", color: "#1B1D2E", padding: "9px 13px", fontWeight: 900, cursor: shareBusy ? "wait" : "pointer" }}>
+                  {shareBusy ? "建立中..." : "產生分享碼"}
+                </button>
+                {shareCode && (
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <input className="field" readOnly value={shareCode} />
+                    <button onClick={copyShareCode} style={{ border: "1px solid #3A3E5C", background: "#262A44", color: "#F5EFE6", borderRadius: 10, padding: "0 12px", cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+                      {copied ? <Check size={15} /> : <Copy size={15} />} {copied ? "已複製" : "複製"}
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <div style={{ background: "#1F2238", borderRadius: 12, padding: 14 }}>
+                <div style={{ fontWeight: 800, marginBottom: 5 }}>輸入朋友的分享碼</div>
+                <div style={{ fontSize: 12, color: "#9B9BC0", marginBottom: 10 }}>只會「加入」朋友的作品，不會覆蓋你自己的作品。</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input className="field" placeholder="例如 ABCD7K2P" value={shareInput} onChange={(e) => setShareInput(e.target.value.toUpperCase())} />
+                  <button disabled={shareBusy} onClick={importShare} style={{ border: "none", borderRadius: 10, background: "#F2A65A", color: "#1B1D2E", padding: "0 14px", fontWeight: 900, cursor: shareBusy ? "wait" : "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+                    <Download size={15} /> 匯入
+                  </button>
+                </div>
+              </div>
+
+              <div style={{ marginTop: 12, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                <button onClick={exportBackup} style={{ border: "1px solid #3A3E5C", background: "transparent", color: "#9B9BC0", borderRadius: 9, padding: "7px 10px", cursor: "pointer", fontSize: 12 }}>
+                  備份成 JSON
+                </button>
+                <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11.5, color: isSupabaseConfigured ? "#5FD3C4" : "#9B9BC0" }}>
+                  {isSupabaseConfigured ? <Cloud size={14} /> : <CloudOff size={14} />}
+                  {isSupabaseConfigured ? "雲端分享已啟用" : "尚未連接雲端"}
+                </div>
+              </div>
+              {shareMessage && <div style={{ marginTop: 10, padding: 10, borderRadius: 9, background: "#1F2238", color: "#C7C6E0", fontSize: 12, lineHeight: 1.5 }}>{shareMessage}</div>}
             </div>
           </div>
         )}
